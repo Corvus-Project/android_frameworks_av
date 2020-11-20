@@ -16,6 +16,7 @@
 
 #define LOG_TAG "Camera3-HeicCompositeStream"
 #define ATRACE_TAG ATRACE_TAG_CAMERA
+#define ALIGN(x, mask) ( ((x) + (mask) - 1) & ~((mask) - 1) )
 //#define LOG_NDEBUG 0
 
 #include <linux/memfd.h>
