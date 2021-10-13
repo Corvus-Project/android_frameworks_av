@@ -129,6 +129,7 @@ sp<Codec2Buffer> InputBuffers::cloneAndReleaseBuffer(const sp<MediaCodecBuffer> 
     if (!copy->copy(c2buffer)) {
         return nullptr;
     }
+    copy->meta()->extend(buffer->meta());
     return copy;
 }
 
@@ -276,7 +277,7 @@ OutputBuffers::BufferAction OutputBuffers::popFromStashAndRegister(
     *c2Buffer = entry.buffer;
     sp<AMessage> outputFormat = entry.format;
 
-    if (entry.notify && mFormat != outputFormat) {
+    if (entry.notify && outputFormat && mFormat != outputFormat) {
         updateSkipCutBuffer(outputFormat);
         // Trigger image data processing to the new format
         mLastImageData.clear();
@@ -1277,6 +1278,15 @@ std::function<sp<Codec2Buffer>()> LinearOutputBuffers::getAlloc() {
     return [format = mFormat]{
         // TODO: proper max output size
         return new LocalLinearBuffer(format, new ABuffer(kLinearBufferSize));
+    };
+}
+
+// LinearMetadataOutputBuffers
+
+std::function<sp<Codec2Buffer>()> LinearMetadataOutputBuffers::getAlloc() {
+    return [format = mFormat]{
+        // TODO: proper max output size
+        return new LocalLinearMetadataBuffer(format, new ABuffer(kLinearBufferSize));
     };
 }
 

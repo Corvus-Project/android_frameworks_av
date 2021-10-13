@@ -51,6 +51,8 @@ cc_defaults {
         "frameworks/av/media/libstagefright",
         "frameworks/native/include/media/openmax",
         "frameworks/native/include/android",
+	"frameworks/av/media/libavextensions",
+	"frameworks/av/media/libmediaplayerservice",
     ],
 
     arch: {
@@ -83,7 +85,7 @@ cc_library_static {
 
 cc_library_static {
     name: "libstagefright_rtsp_player2",
-
+    cflags: ["-D__NO_AVEXTENSIONS__"],
     srcs: ["NetworkUtilsForAppProc.cpp"],
     defaults: ["libstagefright_rtsp_defaults"],
 }

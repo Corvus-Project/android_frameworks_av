@@ -78,6 +78,7 @@ cc_test {
         "libhidlmemory",
         "libhidlbase",
         "libbase",
+        "libstagefright_omx_utils",
     ],
 
     include_dirs: [

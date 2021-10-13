@@ -680,6 +680,7 @@ public:
      */
             static const char * convertTransferToText(transfer_type transferType);
 
+public:
     /* Returns a handle on the audio output used by this AudioTrack.
      *
      * Parameters:
@@ -1132,6 +1133,8 @@ public:
             /* Sets the Audio Description Mix level in dB. */
             status_t setAudioDescriptionMixLevel_l(float leveldB);
 
+            void     createDummyAudioSessionForA2DP();
+
     // Next 4 fields may be changed if IAudioTrack is re-created, but always != 0
     sp<media::IAudioTrack>  mAudioTrack;
     sp<IMemory>             mCblkMemory;
@@ -1339,6 +1342,8 @@ public:
 
     sp<media::VolumeHandler>       mVolumeHandler;
 
+    int64_t                mPauseTimeRealUs;
+
 private:
     class DeathNotifier : public IBinder::DeathRecipient {
     public:
@@ -1379,6 +1384,8 @@ private:
     MediaMetrics mMediaMetrics;
     std::string mMetricsId;  // GUARDED_BY(mLock), could change in createTrack_l().
     std::string mCallerName; // for example "aaudio"
+
+    bool                    mTrackOffloaded;
 
 private:
     class AudioTrackCallback : public media::BnAudioTrackCallback {

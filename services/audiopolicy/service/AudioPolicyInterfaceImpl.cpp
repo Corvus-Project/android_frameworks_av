@@ -19,6 +19,7 @@
 
 #include "AudioPolicyService.h"
 #include "TypeConverter.h"
+#include <cutils/properties.h>
 #include <media/AidlConversion.h>
 #include <media/AudioPolicy.h>
 #include <media/AudioValidator.h>
@@ -414,6 +415,15 @@ Status AudioPolicyService::startOutput(int32_t portIdAidl)
         return binderStatusFromStatusT(NO_INIT);
     }
     ALOGV("startOutput()");
+    return binderStatusFromStatusT(mOutputCommandThread->startOutputCommand(portId));
+}
+
+status_t AudioPolicyService::doStartOutput(audio_port_handle_t portId)
+{
+    if (mAudioPolicyManager == NULL) {
+        return NO_INIT;
+    }
+    ALOGV("doStartOutput()");
     sp<AudioPlaybackClient> client;
     sp<AudioPolicyEffects>audioPolicyEffects;
 
@@ -433,7 +443,7 @@ Status AudioPolicyService::startOutput(int32_t portIdAidl)
     if (status == NO_ERROR) {
         client->active = true;
     }
-    return binderStatusFromStatusT(status);
+    return status;
 }
 
 Status AudioPolicyService::stopOutput(int32_t portIdAidl)
@@ -647,8 +657,18 @@ Status AudioPolicyService::getInputForAttr(const media::AudioAttributesInternal&
                 // FIXME: use the same permission as for remote submix for now.
             case AudioPolicyInterface::API_INPUT_MIX_CAPTURE:
                 if (!canCaptureOutput) {
-                    ALOGE("getInputForAttr() permission denied: capture not allowed");
-                    status = PERMISSION_DENIED;
+                    if (property_get_bool("vendor.audio.enable.mirrorlink", false)) {
+                        media::AudioPolicyDeviceState aidlRet;
+                        media::AudioDevice deviceAidl;
+                        deviceAidl.type    = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
+                        deviceAidl.address = "";
+                        auto _ret = getDeviceConnectionState(deviceAidl,&aidlRet);
+                        if( _ret.isOk() && (media::AudioPolicyDeviceState::UNAVAILABLE != aidlRet)){
+                            break;
+                        }
+                  }
+                  ALOGE("getInputForAttr() permission denied: capture not allowed");
+                  status = PERMISSION_DENIED;
                 }
                 break;
             case AudioPolicyInterface::API_INPUT_MIX_EXT_POLICY_REROUTE:

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <list>
 #include <numeric>
+#include <regex>
 
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
@@ -76,6 +77,11 @@ constexpr size_t kRenderingDepth = 3;
 // This is for keeping IGBP's buffer dropping logic in legacy mode other
 // than making it non-blocking. Do not change this value.
 const static size_t kDequeueTimeoutNs = 0;
+
+// If app goes into background, decoding paused. we have WA logic in HAL to sleep some actions.
+// This value is to monitor if decoding is paused then we can signal a new empty work to HAL
+// after app resume to foreground to notify HAL something
+const static uint64_t kPipelinePausedTimeoutMs = 500;
 
 }  // namespace
 
@@ -145,6 +151,7 @@ CCodecBufferChannel::CCodecBufferChannel(
       mFirstValidFrameIndex(0u),
       mMetaMode(MODE_NONE),
       mInputMetEos(false),
+      mLastInputBufferAvailableTs(0u),
       mSendEncryptedInfoBuffer(false) {
     mOutputSurface.lock()->maxDequeueBuffers = kSmoothnessFactor + kRenderingDepth;
     {
@@ -252,7 +259,7 @@ status_t CCodecBufferChannel::queueInputBufferInternal(
                 bool released = input->buffers->releaseBuffer(buffer, nullptr, true);
                 ALOGV("[%s] queueInputBuffer: buffer copied; %sreleased",
                       mName, released ? "" : "not ");
-                buffer.clear();
+                buffer = copy;
             } else {
                 ALOGW("[%s] queueInputBuffer: failed to copy a buffer; this may cause input "
                       "buffer starvation on component.", mName);
@@ -280,6 +287,12 @@ status_t CCodecBufferChannel::queueInputBufferInternal(
             }
         }
     } else if (eos) {
+        Mutexed<Input>::Locked input(mInput);
+        if (input->frameReassembler) {
+            usesFrameReassembler = true;
+            // drain any pending items with eos
+            input->frameReassembler.process(buffer, &items);
+        }
         flags |= C2FrameData::FLAG_END_OF_STREAM;
     }
     if (usesFrameReassembler) {
@@ -339,10 +352,10 @@ status_t CCodecBufferChannel::queueInputBufferInternal(
     } else {
         Mutexed<Input>::Locked input(mInput);
         bool released = false;
-        if (buffer) {
-            released = input->buffers->releaseBuffer(buffer, nullptr, true);
-        } else if (copy) {
+        if (copy) {
             released = input->extraBuffers.releaseSlot(copy, nullptr, true);
+        } else if (buffer) {
+            released = input->buffers->releaseBuffer(buffer, nullptr, true);
         }
         ALOGV("[%s] queueInputBuffer: buffer%s %sreleased",
               mName, (buffer == nullptr) ? "(copy)" : "", released ? "" : "not ");
@@ -686,6 +699,15 @@ status_t CCodecBufferChannel::queueSecureInputBuffer(
     return queueInputBufferInternal(buffer, block, bufferSize);
 }
 
+void CCodecBufferChannel::queueDummyWork() {
+    std::unique_ptr<C2Work> work(new C2Work);
+    // WA: signal a empty work to HAL to trigger specific event, but totally drop the work
+    work->input.flags = C2FrameData::FLAG_DROP_FRAME;
+    std::list<std::unique_ptr<C2Work>> items;
+    items.push_back(std::move(work));
+    (void)mComponent->queue(&items);
+}
+
 void CCodecBufferChannel::feedInputBufferIfAvailable() {
     QueueGuard guard(mSync);
     if (!guard.isRunning()) {
@@ -693,6 +715,21 @@ void CCodecBufferChannel::feedInputBufferIfAvailable() {
         return;
     }
     feedInputBufferIfAvailableInternal();
+
+    // limit this WA to qc hw decoder only
+    // if feedInputBufferIfAvailableInternal() successfully (has available input buffer),
+    // mLastInputBufferAvailableTs would be updated. otherwise, not input buffer available
+    std::regex pattern{"c2\\.qti\\..*\\.decoder.*"};
+    if (std::regex_match(mComponentName, pattern)) {
+        std::lock_guard<std::mutex> tsLock(mTsLock);
+        uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                PipelineWatcher::Clock::now().time_since_epoch()).count();
+        if (now - mLastInputBufferAvailableTs > kPipelinePausedTimeoutMs) {
+            ALOGV("[WA] long time elapsed since last input queued, let's queue a specific work to "
+                    "HAL to notify something");
+            queueDummyWork();
+        }
+    }
 }
 
 void CCodecBufferChannel::feedInputBufferIfAvailableInternal() {
@@ -708,7 +745,9 @@ void CCodecBufferChannel::feedInputBufferIfAvailableInternal() {
         }
     }
     size_t numActiveSlots = 0;
-    while (!mPipelineWatcher.lock()->pipelineFull()) {
+    size_t pipelineRoom = 0;
+    size_t numInputBuffersAvailable = 0;
+    while (!mPipelineWatcher.lock()->pipelineFull(&pipelineRoom)) {
         sp<MediaCodecBuffer> inBuffer;
         size_t index;
         {
@@ -722,8 +761,20 @@ void CCodecBufferChannel::feedInputBufferIfAvailableInternal() {
                 break;
             }
         }
+
+        {
+            std::lock_guard<std::mutex> tsLock(mTsLock);
+            mLastInputBufferAvailableTs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    PipelineWatcher::Clock::now().time_since_epoch()).count();
+        }
+
         ALOGV("[%s] new input index = %zu [%p]", mName, index, inBuffer.get());
         mCallback->onInputBufferAvailable(index, inBuffer);
+        if (++numInputBuffersAvailable >= pipelineRoom) {
+            ALOGV("[%s] pipeline will overflow after %zu queueInputBuffer", mName,
+                    numInputBuffersAvailable);
+            break;
+        }
     }
     ALOGV("[%s] # active slots after feedInputBufferIfAvailable = %zu", mName, numActiveSlots);
 }
@@ -1193,9 +1244,13 @@ status_t CCodecBufferChannel::start(
             Mutexed<OutputSurface>::Locked output(mOutputSurface);
             maxDequeueCount = output->maxDequeueBuffers = numOutputSlots +
                     reorderDepth.value + kRenderingDepth;
+            if (!secure) {
+                output->maxDequeueBuffers += numInputSlots;
+            }
             outputSurface = output->surface ?
                     output->surface->getIGraphicBufferProducer() : nullptr;
             if (outputSurface) {
+                ALOGD("[%s] start: max output delay %u", mName, output->maxDequeueBuffers);
                 output->surface->setMaxDequeuedBufferCount(output->maxDequeueBuffers);
             }
             outputGeneration = output->generation;
@@ -1322,7 +1377,14 @@ status_t CCodecBufferChannel::start(
                 output->buffers.reset(new RawGraphicOutputBuffers(mName));
             }
         } else {
-            output->buffers.reset(new LinearOutputBuffers(mName));
+            // TODO(PC): do this decision based on the secure_mode config being SM_PROTECTED?
+            bool secure = mComponent->getName().find(".secure") != std::string::npos;
+            if (secure) {
+                ALOGD("[%s] Enabling metadata output for secure encoder", mName);
+                output->buffers.reset(new LinearMetadataOutputBuffers(mName));
+            } else {
+                output->buffers.reset(new LinearOutputBuffers(mName));
+            }
         }
         output->buffers->setFormat(outputFormat);
 
@@ -1385,8 +1447,8 @@ status_t CCodecBufferChannel::start(
     // mOutputBuffers are initialized to make sure that lingering callbacks
     // about buffers from the previous generation do not interfere with the
     // newly initialized pipeline capacity.
-
-    if (inputFormat || outputFormat) {
+    {
+        ALOGD("[%s] start: updating output delay %u", mName, outputDelayValue);
         Mutexed<PipelineWatcher>::Locked watcher(mPipelineWatcher);
         watcher->inputDelay(inputDelayValue)
                 .pipelineDelay(pipelineDelayValue)
@@ -1472,6 +1534,12 @@ status_t CCodecBufferChannel::requestInitialInputBuffers() {
             return UNKNOWN_ERROR;
         }
         clientInputBuffers.pop_front();
+    }
+
+    if (!clientInputBuffers.empty()) {
+        std::lock_guard<std::mutex> tsLock(mTsLock);
+        mLastInputBufferAvailableTs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                PipelineWatcher::Clock::now().time_since_epoch()).count();
     }
 
     for (const ClientInputBuffer& clientInputBuffer: clientInputBuffers) {
@@ -1618,7 +1686,16 @@ bool CCodecBufferChannel::handleWork(
 
     if (work->result == C2_OK){
         notifyClient = true;
+    } else if (work->result == C2_OMITTED) {
+        ALOGV("[%s] empty work returned; omitted.", mName);
+        return false; // omitted
     } else if (work->result == C2_NOT_FOUND) {
+        if (work->input.flags & C2FrameData::FLAG_DROP_FRAME) {
+            // NOTE: This is to solve backward compatibility issue of queueDummyWork. If no HAL fix,
+            //       we will receive C2_NOT_FOUND here and then issue fatal error to MediaCodec
+            ALOGV("[%s] empty work returned; omitted.", mName);
+            return false; // omitted
+        }
         ALOGD("[%s] flushed work; ignored.", mName);
     } else {
         // C2_OK and C2_NOT_FOUND are the only results that we accept for processing
@@ -1723,7 +1800,7 @@ bool CCodecBufferChannel::handleWork(
                 if (param->forOutput()) {
                     C2PortActualDelayTuning::output outputDelay;
                     if (outputDelay.updateFrom(*param)) {
-                        ALOGV("[%s] onWorkDone: updating output delay %u",
+                        ALOGD("[%s] onWorkDone: updating output delay %u",
                               mName, outputDelay.value);
                         (void)mPipelineWatcher.lock()->outputDelay(outputDelay.value);
                         newOutputDelay = outputDelay.value;
@@ -1820,6 +1897,8 @@ bool CCodecBufferChannel::handleWork(
             maxDequeueCount = output->maxDequeueBuffers =
                     numOutputSlots + reorderDepth + kRenderingDepth;
             if (output->surface) {
+                ALOGI("[%s] onWorkDone: updating max output delay %u",
+                        mName, output->maxDequeueBuffers);
                 output->surface->setMaxDequeuedBufferCount(output->maxDequeueBuffers);
             }
         }
@@ -1870,7 +1949,10 @@ bool CCodecBufferChannel::handleWork(
             outBuffer->meta()->setInt64("timeUs", timestamp.peek());
             outBuffer->meta()->setInt32("flags", MediaCodec::BUFFER_FLAG_CODECCONFIG);
             ALOGV("[%s] onWorkDone: csd index = %zu [%p]", mName, index, outBuffer.get());
-
+            if (outputFormat) {
+                ALOGD("[%s] sending CSD : output format changed to %s",
+                      mName, outputFormat->debugString().c_str());
+            }
             output.unlock();
             mCallback->onOutputBufferAvailable(index, outBuffer);
         } else {
@@ -1879,6 +1961,12 @@ bool CCodecBufferChannel::handleWork(
             mCCodecCallback->onError(UNKNOWN_ERROR, ACTION_CODE_FATAL);
             return false;
         }
+    }
+
+    if (worklet->output.flags & C2FrameData::FLAG_DROP_FRAME) {
+        ALOGV("[%s] onWorkDone: drop output buffer (%lld)",
+              mName, work->input.ordinal.frameIndex.peekull());
+        notifyClient = false;
     }
 
     if (notifyClient && !buffer && !flags) {
@@ -1912,7 +2000,7 @@ bool CCodecBufferChannel::handleWork(
                 notifyClient,
                 timestamp.peek(),
                 flags,
-                outputFormat,
+                (initData == nullptr ? outputFormat : nullptr),
                 worklet->output.ordinal);
     }
     sendOutputBuffers();
@@ -2020,7 +2108,9 @@ PipelineWatcher::Clock::duration CCodecBufferChannel::elapsed() {
     if (!mInputMetEos) {
         size_t outputDelay = mOutput.lock()->outputDelay;
         Mutexed<Input>::Locked input(mInput);
-        n = input->inputDelay + input->pipelineDelay + outputDelay;
+        n = input->inputDelay + input->pipelineDelay + outputDelay + kSmoothnessFactor;
+        ALOGD("[%s] DEBUG: elapsed: n=%zu [in=%u pipeline=%u out=%zu]", mName, n,
+                input->inputDelay, input->pipelineDelay, outputDelay);
     }
     return mPipelineWatcher.lock()->elapsed(PipelineWatcher::Clock::now(), n);
 }
